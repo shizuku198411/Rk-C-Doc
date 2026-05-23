@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Rk-C Documentation</title>
+    <link rel="icon" href="/favicon.ico" />
+    <meta
+      name="description"
+      content="Architecture and API documentation for the Rk-C RISC-V 64-bit microkernel."
+    />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      const currentUrl = new URL(window.location.href);
+      const redirect = currentUrl.searchParams.get("redirect");
+      if (redirect) {
+        const cleanBase = currentUrl.pathname.endsWith("/")
+          ? currentUrl.pathname
+          : `${currentUrl.pathname}/`;
+        window.history.replaceState(
+          null,
+          "",
+          `${cleanBase}${redirect.replace(/^\//, "")}`,
+        );
+      }
+    </script>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
