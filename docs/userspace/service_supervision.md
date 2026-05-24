@@ -3,7 +3,7 @@ title: Service Supervision and Control
 section: userspace
 status: Implemented
 updated: 2026-05-24
-order: 3
+order: 4
 excerpt: svcmgtd startup ordering, readiness protocol, liveness monitoring, restart policy, and svc commands.
 tags: svcmgtd, services, lifecycle, supervision, svc
 ---

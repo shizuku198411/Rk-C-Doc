@@ -3,7 +3,7 @@ title: Storage and Proc Filesystem Services
 section: userspace
 status: Implemented
 updated: 2026-05-24
-order: 4
+order: 5
 excerpt: blockd, fsd, and procfsd roles in the userspace storage and observability stack.
 tags: blockd, fsd, procfsd, filesystem, storage
 ---

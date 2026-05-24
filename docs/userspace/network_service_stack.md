@@ -3,7 +3,7 @@ title: Network Service Stack
 section: userspace
 status: Implemented
 updated: 2026-05-24
-order: 6
+order: 7
 excerpt: netd initialization, protocol layers, IPC endpoints, configuration, and HTTP/TLS client consumers.
 tags: netd, virtio-net, tcp, udp, dns, tls
 ---

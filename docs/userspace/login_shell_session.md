@@ -3,7 +3,7 @@ title: Login and Shell Session
 section: userspace
 status: Implemented
 updated: 2026-05-24
-order: 2
+order: 3
 excerpt: Authenticated session creation, shell state, built-ins, child commands, pipes, and redirection.
 tags: login, shell, session, pipe, redirect
 ---
@@ -48,7 +48,7 @@ The username, system name, and current working directory are highlighted in the 
 
 ## Shell Command Model
 
-The shell maintains heap-backed buffers for line editing and command processing. An interactive line is handled in the following order:
+The shell maintains its mutable line, command, path, history-serialization, and pipe/redirection workspace in a single Nim ORC-managed arena, while bounded session records remain fixed-size storage. An interactive line is handled in the following order:
 
 1. Read and edit one input line.
 2. Detect stdout redirection using `>`.

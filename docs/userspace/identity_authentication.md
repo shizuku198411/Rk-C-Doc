@@ -3,7 +3,7 @@ title: Identity and Authentication Service
 section: userspace
 status: Implemented
 updated: 2026-05-24
-order: 5
+order: 6
 excerpt: userd databases, password hashing, login authentication, account resolution, and password changes.
 tags: userd, authentication, passwd, shadow, uid
 ---
