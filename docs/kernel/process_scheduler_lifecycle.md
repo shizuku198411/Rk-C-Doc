@@ -10,172 +10,223 @@ tags: process, scheduler, context-switch, lifecycle, signal
 
 ## Process Model
 
-Rk-C maintains a fixed process table with 32 slots. Each slot represents either a kernel task or a U-mode process and contains scheduling, identity, memory, IPC, and file-descriptor state.
+Rk-C uses a fixed-size process table with `MaxProcs = 32` slots. Each slot can contain either a kernel task or a user process, and the kernel keeps all scheduling, identity, memory, IPC, and file-descriptor state inside the `Process` object in `src/kernel/task/process.nim`.
 
-| Process Field Group | Stored State |
+| Process State Group | Stored State |
 | --- | --- |
 | Identity | PID, parent PID, UID, GID, executable path, current working directory |
-| Scheduling | Lifecycle state, saved context, kernel stack, wait target, CPU tick counters |
-| User execution | Page table, image layout, stack, heap bounds, requested and granted capabilities |
-| Communication | Per-process structured IPC queue and pending signal mask |
-| Files | Per-process FD table with file offsets, device kinds, and pipe handles |
+| Scheduling | `ProcessState`, kernel context, kernel stack, wait target, CPU accounting |
+| User execution | user page table, entry PC, stack and heap bounds, capability masks |
+| Communication | per-process IPC queue, pending signal bits |
+| Files | per-process FD table with flags, offsets, kinds, and pipe IDs |
 
-Every process receives a kernel stack of four pages, or 16 KiB.
+Each process receives a dedicated kernel stack of `KernelStackPages = 4` pages (16 KiB). User-mode register state is not stored inside `Process.context`; it is preserved separately in the trap frame on the kernel stack when a user trap or syscall happens.
 
 ## Lifecycle States
 
-```text
-                 exec / create
- unused  ----------------------------> runnable
-                                          |
-                                          | selected
-                                          v
-                                      running
-                                      /  |   \
-                    wait/sleep/IPC  /   |    \ exit/fault/signal
-                                    v    |     v
-                                sleeping |   zombie
-                                    |    |     |
-                              wake  +----+     | wait or detached reap
-                                               v
-                                             unused
-```
+The process state machine is represented by `ProcessState`:
 
 | State | Meaning |
 | --- | --- |
-| `unused` | Slot contains no live process and may be allocated |
-| `runnable` | Ready for scheduler selection |
-| `running` | Current CPU owner |
-| `sleeping` | Blocked on a typed wait target |
-| `zombie` | Execution stopped; exit status retained until reaped |
+| `procUnused` | Slot is available for allocation |
+| `procRunnable` | Eligible for scheduler selection |
+| `procRunning` | Current CPU owner |
+| `procSleeping` | Blocked on one typed wait condition |
+| `procZombie` | Terminated; exit status retained until reaped |
+
+A process transitions through these states when it is created, scheduled, blocked, signaled, exited, or reclaimed.
 
 ## Context Switching
 
-The software scheduler uses cooperative boundaries plus timer-triggered preemption from U-mode. The low-level context switch preserves only the callee-saved kernel scheduling context:
+The low-level context switch preserves only the kernel scheduling context held in `Context`:
 
-| Saved Context | Registers |
-| --- | --- |
-| Control | `ra`, `sp` |
-| Callee-saved | `s0` through `s11` |
+- `ra`, `sp`
+- `s0`..`s11`
 
-Full user register state during an interrupt or syscall belongs to the trap frame on that process kernel stack. This separates ordinary kernel task scheduling context from interrupted user execution state.
+This context is saved for kernel task scheduling in `src/kernel/task/internal/scheduler.nim`. User register state is kept in the trap frame built by the architecture trap entry path, which keeps user execution state separate from kernel scheduling state.
+
+`currentProc` points to the currently selected `Process`. The kernel uses `arch.writeSscratch(next.kernelStack + KernelStackPages * PageSize)` to keep the next process's kernel stack top in `sscratch` before switching.
 
 ## Scheduler Selection
 
-Scheduling is round-robin over the fixed table:
+Scheduler selection is implemented by `schedule()` in `src/kernel/task/internal/scheduler.nim`.
 
-1. Reap any detached zombies.
-2. Begin scanning immediately after the current process slot.
-3. Choose the first runnable non-idle process.
-4. Choose the idle task only when no other runnable process exists.
-5. Select that process root page table or the kernel root table.
-6. Write `satp`, flush the TLB, and update `sscratch` to its kernel stack top.
-7. Switch saved kernel contexts unless the same process remains selected.
+The selection algorithm is:
 
-```text
-current slot i
-   |
-   v
-scan i+1, i+2, ... wrapping once
-   |
-   +-- runnable normal process found --> switch to it
-   |
-   +-- none found and idle runnable ---> switch to idle
-   |
-   +-- no available execution path ----> panic
-```
+1. Call `reapDetachedZombies()` to reclaim any detached zombie slots.
+2. Start scanning from the slot immediately after the current process.
+3. Select the first process with `state == procRunnable` that is not the idle process.
+4. If none is found, consider the idle process if its state is `procRunnable` or `procRunning`.
+5. If still none is found, keep the previous process running if it is still `procRunning` or `procRunnable`.
+6. If no runnable process exists, panic.
 
-The idle task enables supervisor interrupts and executes `wfi`, preventing a busy loop when every user process or service is sleeping.
+This is a simple round-robin scheduler over the fixed process list.
+
+### Root page table and address space switch
+
+When a next process is selected, the scheduler chooses its page table:
+
+- `next.rootPageTable` if set
+- otherwise `kernelPageTable`
+
+It writes the chosen root page table into `satp`, flushes the TLB, and updates `sscratch` to the next process's kernel stack top.
+
+If the next process is different from the current process, `schedule()` performs a `contextSwitch(prev.context, next.context)`.
+
+## Cooperative and Timer-Driven Yielding
+
+The kernel combines explicit yielding with timer-driven preemption.
+
+- `yieldCpu()` marks the current running process as `procRunnable` and calls `schedule()`.
+- `requestResched()` sets the global `needResched` flag.
+- `maybeYieldOnResched()` checks `needResched`; if true, it clears the flag and calls `yieldCpu()`.
+
+The trap scheduler invokes `maybeYieldOnResched()` at the end of a user-mode trap return path, making timer interrupts an explicit preemption boundary.
 
 ## Typed Waiting
 
-A sleeping process stores one wait kind plus one numeric target value. This avoids a growing set of independent `waitingFor...` flags.
+Sleeping processes use a single typed wait record `WaitTarget` with:
 
-| Wait Kind | Target Value |
-| --- | --- |
-| Console input | Sentinel value |
-| IPC receive | Sentinel value |
-| Child PID | Target PID |
-| Filesystem response | Request ID |
-| Block response | Request ID |
-| Timer sleep | Wake tick |
-| Pipe read / write | Pipe ID |
-| Poll | Deadline tick |
+- `kind: WaitKind`
+- `value: U64`
 
-Wake operations scan sleeping slots, compare kind and target, clear the wait record, and return matching processes to runnable state.
+This avoids multiple independent wait flags.
 
-## Process Creation and Execution
+Wait kinds include:
 
-Kernel tasks are created with root identity, `/` as current working directory, standard descriptors, and an allocated kernel stack.
+- `waitInput` — ready when console input arrives
+- `waitIpc` — ready when an IPC reply arrives for this process
+- `waitPid` — ready when a child process exits
+- `waitFsReq` — ready when a filesystem request completes
+- `waitBlockReq` — ready when a block request completes
+- `waitTimer` — ready when a timeout tick is reached
+- `waitPipeRead` — ready when pipe data becomes readable
+- `waitPipeWrite` — ready when pipe space becomes writable
+- `waitPoll` — ready when a poll deadline or event occurs
 
-Userspace command execution follows a fork-like metadata model without copying the previous user image:
+`sleepCurrentFor(kind, value)` sets the current process state to `procSleeping`, records the wait target, calls `schedule()`, and then runs `deliverCurrentSignals()` after the swap.
 
-```text
-parent process
-   |
-   | allocate child process slot and kernel stack
-   | construct fresh user page table
-   | load requested RKX image into child address space
-   | copy execution metadata from parent
-   v
-child: new binary + inherited uid/gid/cwd/fds
-```
+### Wake operations
 
-The inherited FD table retains pipe endpoint references, which is required for shell pipelines and redirect setup. Identity can be explicitly replaced only through the root-authorized execution path used by login to launch a shell for an authenticated user.
+Wake helpers scan the process table and transition matching sleepers back to `procRunnable`:
 
-## Standard Descriptors and Inheritance
+- `wakeWaiters(kind, value, wakeAll)` wakes matching sleepers by exact kind/value match
+- `wakeInputWaiters()` wakes `waitInput` processes and poll waiters
+- `wakeIpcWaiter(pid)` wakes the user process waiting for IPC from `pid`
+- `wakeFsWaiter(reqId)` wakes filesystem waiters for a request ID
+- `wakeBlockWaiter(reqId)` wakes block waiters for a request ID
+- `wakePidWaiters(pid)` wakes parents waiting for a child PID
+- `wakeTimerWaiters(tick)` wakes timer and poll waiters whose deadline has passed
+- `wakePipeReaders(pipeId)` / `wakePipeWriters(pipeId)` wake pipe waiters
+- `wakePollWaiters()` wakes poll waiters independently of the specific event
 
-Initial process descriptor assignments are:
+## Kernel and User Process Creation
+
+Kernel tasks are created by `createKernelProcessInternal()` with root identity, `/` cwd, standard file descriptors, and an allocated kernel stack. The idle task is created at boot and becomes `idleProc`.
+
+User processes are allocated through `allocUserProcessFromParent()`:
+
+- allocates a kernel task slot using `createKernelProcessInternal(userProcessBootstrap, false, "user_proc")`
+- marks `user.active = true`
+- inheriting metadata from the parent if requested
+- sets the initial state to `procSleeping`
+
+`configureUserProcess()` then assigns:
+
+- the user root page table
+- executable path and argument metadata
+- user text/data/rodata/bss mappings
+- stack top and user stack pointer
+- heap bounds and heap limit
+- capability masks
+
+It computes the user heap limit using a one-page guard between heap and stack.
+
+### User process bootstrap
+
+User processes start in `processBootstrap()`:
+
+- the process entry function is `userProcessBootstrap`
+- `processBootstrap()` invokes `currentProc.entry()`
+- when that entry returns, the process is marked `procZombie`
+- `schedule()` is called so the kernel can switch away from the dead process
+
+`userProcessBootstrap()` enters user mode via `arch.enterUser()` with the configured user PC, stack, and arguments.
+
+## Descriptor Inheritance and Pipes
+
+When a user process is created from a parent, `inheritProcessMetadata()` copies:
+
+- parent identity and current working directory
+- parent file descriptor entries
+
+The child inherits pipe endpoint counts so shell pipelines and redirections work correctly.
+
+Standard descriptors are initialized for each process:
 
 | FD | Path | Kind | Access |
 | --- | --- | --- | --- |
-| `0` | `/dev/stdin` | Standard input device | Read |
-| `1` | `/dev/stdout` | Standard output device | Write |
-| `2` | `/dev/stderr` | Standard error device | Write |
+| `0` | `/dev/stdin` | standard input | read |
+| `1` | `/dev/stdout` | standard output | write |
+| `2` | `/dev/stderr` | standard error | write |
 
-When a child is created from a parent, descriptors are copied and pipe endpoint reader/writer counts are retained. When a process exits or an FD is closed, pipe endpoints are released and blocked opposite endpoints can be awakened.
+When an FD is closed, pipe endpoint counts are decremented and opposite endpoints are awakened if they were blocked.
 
 ## Exit, Signals, and Reaping
 
-Termination converts a process into a zombie, clears wait state, closes its FD table, removes pending signals, and records an exit status. Its memory remains owned until process discard at reap time.
+Process termination is handled by `markProcessZombie()` in `src/kernel/task/internal/wait_signals.nim`.
 
-| Event | Stored Exit Status |
-| --- | --- |
-| Normal `exit(status)` | Supplied status |
-| Terminate signal | `143` |
-| Interrupt signal | `130` |
-| Contained user fault | `255` |
+On exit, the kernel:
 
-Upon transition to zombie:
+- detaches any live child processes
+- records `exitStatus`
+- clears the wait target
+- clears file state and pending signals
+- sets `state = procZombie`
+- wakes any waiters on this PID
+- sends `SysSignalChildExited` to the parent if one exists
 
-- Live children are detached from the exiting parent.
-- A parent waiting for that PID is awakened.
-- A parent process receives a child-exited signal when one exists.
-- Detached zombies are reclaimed automatically during future scheduling.
-- A non-detached child is reclaimed when its parent waits and obtains status.
+Detached zombies are automatically reclaimed by `reapDetachedZombies()` during `schedule()`. A process is detached when its parent has gone away or when it has been explicitly orphaned.
 
-Reclamation releases user image, stack, heap, private page tables, the kernel stack, and process-owned descriptor state before returning the slot to `unused`.
+`reapDetachedZombies()` calls `discardProcess()` to free:
 
-## Runtime Observability
+- user address space pages and page tables
+- the kernel stack
+- file state, IPC queue, and kernel-side resources
+- the process slot itself by resetting it to `procUnused`
 
-The following actual `ps` result shows the system after the required and optional servers reached ready state and an authenticated root shell was started. The `ps` process itself appears as a child of that shell.
+`killCurrentUserProcess(status)` kills the current runnable user process from a kernel path by marking it zombie and calling `schedule()`.
 
-```text
-root@Rk-C:/$ ps -e -f -l
-pid     ppid    uid     gid     state           mode    cpu     mem     exe
-3       0       root    root    sleeping        user    0%      16p     /bin/svcmgtd
-4       3       root    root    running         user    0%      11p     /bin/procmgtd
-5       3       root    root    sleeping        user    0%      11p     /bin/blockd
-6       3       root    root    sleeping        user    0%      16p     /bin/fsd
-7       3       root    root    sleeping        user    0%      22p     /bin/userd
-8       3       root    root    sleeping        user    0%      25p     /bin/procfsd
-9       3       root    root    sleeping        user    0%      27p     /bin/netd
-10      0       root    root    sleeping        user    0%      10p     /bin/login
-11      10      root    root    sleeping        user    0%      19p     /bin/shell
-14      11      root    root    sleeping        user    0%      13p     /bin/ps
-root@Rk-C:/$
-```
+## Signal Delivery
 
-PIDs and page counts are observed values rather than stable ABI values; the important relation is the supervisor-parented server set and the `login -> shell -> command` session tree.
+Signals are represented as bit flags in `pendingSignals`.
 
-Process metadata exported to service-backed observability includes PID, PPID, UID, GID, lifecycle state, execution mode, CPU ticks and percentage, memory page counts, user segment locations, stack and heap information, capability masks, pending signals, and executable path.
+- `sendProcessSignal(pid, signal)` sets the bit and wakes the target process via `wakeProcessForSignal()`.
+- `wakeProcessForSignal()` converts a sleeping process to `procRunnable` and requests rescheduling.
+- `deliverCurrentSignals()` runs when a user process returns from a trap; it checks for `SysSignalTerminate` and `SysSignalInterrupt` and kills the current process with a status of `143` or `130`, respectively.
+
+`takeProcessSignal()` selects the highest-priority pending signal for a process, returning `SysSignalTerminate`, `SysSignalInterrupt`, `SysSignalChildExited`, or `SysSignalServiceStopped`.
+
+## Idle Task Behavior
+
+The idle task is a special kernel process that runs when no normal user process is runnable. Its loop is:
+
+1. `maybeYieldOnResched()`
+2. enable supervisor interrupts by setting `SstatusSie`
+3. `arch.wfi()`
+
+This prevents busy-waiting when all user processes are sleeping and allows timer interrupts to wake scheduling decisions.
+
+## Observability
+
+Process metadata exposed by `ps` and service-backed observability includes:
+
+- PID, PPID, UID, GID
+- lifecycle state and execution mode
+- CPU ticks and window CPU percentage
+- memory page counts and address-space segment sizes
+- stack and heap bounds
+- capability masks and pending signals
+- executable path and current working directory
+
+This metadata is derived from the `Process` object rather than being a separate runtime table.

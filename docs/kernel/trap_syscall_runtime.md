@@ -10,33 +10,35 @@ tags: trap, syscall, riscv64, timer, strace
 
 ## Responsibility
 
-The trap subsystem is the kernel's transition point for user ecalls, timer interrupts, and synchronous faults. It must preserve interrupted register state, harden supervisor execution state, classify the event, and either resume, reschedule, terminate a user process, or stop the kernel.
+The trap subsystem is the kernel's transition point for user `ecall`s, timer interrupts, and synchronous faults. It preserves interrupted register state, hardens supervisor handler state, classifies the event, and either resumes user execution, requests rescheduling, terminates a process, or halts the kernel.
 
-## Trap Vector and Stack Transition
+## Bootstrapping Trap Entry
 
-Bootstrap installs the trap entry address in `stvec`. User execution stores the current process kernel stack top in `sscratch`. On entry, assembly examines the previous privilege encoded in `sstatus.SPP`:
+At boot, `src/kernel/init/bootstrap.nim` writes the trap entry address into `stvec` using `arch.writeStvec(cast[U64](arch.trapEntry))`. The scheduler initializes each user process by storing the process's kernel stack top in `sscratch`:
 
-| Origin | Stack Handling |
-| --- | --- |
-| U-mode | Exchange user `sp` with the kernel stack held in `sscratch` |
-| S-mode | Keep the current supervisor stack and update `sscratch` |
+- On a trap from U-mode, `trap_entry` exchanges the current `sp` with the kernel stack top stored in `sscratch`.
+- On a trap from S-mode, `trap_entry` keeps the current supervisor stack and updates `sscratch` with that value.
 
-The handler disables supervisor interrupts during frame construction and clears `sstatus.SUM` before any Nim kernel handler executes. The saved interrupted `sstatus` is restored before `sret`, so SUM is never unintentionally inherited as kernel handler state.
+The privilege origin is detected from `sstatus.SPP`.
 
-```text
-interrupted U-mode                         kernel trap handler
+### `trap_entry` runtime sequence
 
- user sp ----+                         +--> classify scause
-             |   csrrw sp,sscratch,sp |    syscall / timer / fault
- kernel sp <-+------------------------+    mutate saved frame as needed
-                 save TrapFrame       |    maybe schedule
-                 SUM forced off       |
-                 kernel gp restored   +--> restore frame, sret
-```
+1. Read `sstatus`, mask `SPP`, branch on previous mode.
+2. If previous mode is U-mode, swap `sp` and `sscratch`.
+3. If previous mode is S-mode, store the current `sp` into `sscratch`.
+4. Clear the SUM bit in `sstatus` before running kernel code.
+5. Allocate `8 * 34` bytes on the kernel stack.
+6. Save `ra`, `gp`, `tp`, `t0`-`t6`, `a0`-`a7`, and `s0`-`s11`.
+7. Save the interrupted user `sscratch`, `sepc`, and original `sstatus`.
+8. Set `sscratch` to point at the saved trap frame top.
+9. Initialize the kernel global pointer and call `trap_handler`.
+10. Restore `sepc`, `sstatus`, all registers, swap back `sp`, and execute `sret`.
+
+By clearing `SUM` inside the trap entry and restoring the original `sstatus` only at the end, the kernel ensures supervisor handlers never inherit user-accessible memory permissions.
 
 ## Trap Frame Layout
 
-Trap entry allocates 34 machine words, or 272 bytes, on the selected kernel stack. The meaningful saved fields are:
+The trap frame is a 34-word object (`272` bytes) stored on the kernel stack. `src/kernel/trap/trap_types.nim` defines it explicitly.
 
 | Group | Fields |
 | --- | --- |
@@ -45,101 +47,116 @@ Trap entry allocates 34 machine words, or 272 bytes, on the selected kernel stac
 | Arguments | `a0` through `a7` |
 | Callee-saved | `s0` through `s11` |
 | Interrupted control state | original `sp`, `sepc`, `sstatus` |
+| Reserved | `reserved0` (alignment / future use) |
 
-The trap dispatcher receives a pointer to this saved frame. Syscall results are written back to `a0`; resuming execution restores all registers from the same frame.
+The saved `sp` is the interrupted user stack pointer; the current kernel `sp` is the frame pointer into the saved trap frame. The kernel handler receives `a0` as a pointer to this frame, and all fields are restored before `sret`.
 
-## Recognized Trap Classes
+## Trap Dispatch and Runtime
 
-| Event | `scause` Value | Kernel Behavior |
+`trap_handler` in `src/kernel/trap/trap.nim` is the central dispatch point. It reads `scause`, `stval`, and the interrupted program counter from the saved frame, then dispatches by trap class.
+
+The helper `trapFromUser(frame)` returns true when `(frame.sstatus and SstatusSpp) == 0`, i.e. the interrupt came from U-mode.
+
+### Recognized trap classes
+
+| Event | Constant | Kernel Behavior |
 | --- | --- | --- |
-| U-mode environment call | `0x08` | Dispatch syscall and advance `sepc` by 4 |
-| S-mode environment call | `0x09` | Panic |
-| Supervisor timer interrupt | interrupt bit plus `0x05` | Account tick, wake waits, request reschedule |
-| Instruction page fault | `0x0c` | Kill user process or panic if from S-mode |
-| Load page fault | `0x0d` | Kill user process or panic if from S-mode |
-| Store/AMO page fault | `0x0f` | Kill user process or panic if from S-mode |
-| Misaligned, access-fault, illegal, or breakpoint exceptions | `0x00` through `0x07` as defined by RISC-V | Kill user process or panic if privileged |
+| U-mode environment call | `ScauseEnvironmentCallFromUMode` | `handleSyscall(frame)`; `frame.sepc += 4`; deliver signals; maybe yield |
+| S-mode environment call | `ScauseEnvironmentCallFromSMode` | `panicMsg("Environment Call from S-Mode", ...)` |
+| Supervisor timer interrupt | `ScauseSupervisorTimer` | tick accounting, wake waits, schedule request, optional user reschedule |
+| Instruction/Load/Store page fault | `ScauseInstructionPageFault`, `ScauseLoadPageFault`, `ScauseStoreAMOPageFault` | `faultOrPanic(...)` |
+| Misaligned/access/illegal/breakpoint | `ScauseInstructionAddressMisaligned`, `ScauseLoadAccessFault`, `ScauseStoreAMOAccessFault`, `ScauseIllegalInstruction`, `ScauseBreakpoint` | `faultOrPanic(...)` |
 
-Trap counters are incremented per class and exposed through the trap observability path.
+Each class increments a per-trap counter before handling. `trap_handler` treats user-mode faults as process termination events and supervisor-mode faults as kernel panics.
 
-## Syscall ABI
+## Syscall ABI and Dispatcher
 
-Userspace enters the kernel with `ecall`. The ABI currently uses:
+Userspace issues syscalls via `ecall` with the syscall number in `a3`. The kernel saves all argument registers in the trap frame, so the runtime preserves the full register state across the trap.
 
-| Register | Meaning on Entry | Meaning on Return |
+| Register | Entry role | Return semantics |
 | --- | --- | --- |
-| `a0` | First argument | Result or negative failure encoded in `U64` |
-| `a1` | Second argument | Preserved only as ordinary register-frame state |
-| `a2` | Third argument | Preserved only as ordinary register-frame state |
-| `a3` | Syscall numeric identifier | Preserved only as ordinary register-frame state |
+| `a0` | arg0 / pointer | result or encoded negative error |
+| `a1` | arg1 / pointer | preserved in saved frame |
+| `a2` | arg2 / pointer | preserved in saved frame |
+| `a3` | syscall number | preserved in saved frame |
+| `a4` .. `a7` | additional args | preserved in saved frame |
 
-Syscall identifiers are shared between kernel and userspace. The defined range currently extends through:
+`handleSyscall(frame)` performs:
 
-| Number | Syscall | Role |
-| --- | --- | --- |
-| `1` | `write` | Compatibility stdout write path |
-| `11` | `exec` | Start a child RKX application |
-| `22` / `23` | `ipc_send` / `ipc_receive` | Text IPC |
-| `47` - `49` | Packet IPC operations | Structured IPC transport |
-| `57` - `63` | FD, pipe, and `dup2` operations | Stream I/O foundation |
-| `64` | `service_ready` | Registry readiness mutation |
-| `68` | `poll` | Wait for FD, IPC, PID, or timer events |
-| `86` / `87` | `brk` / `sbrk` | Per-process heap management |
+1. `traceSyscallEnter(frame)`
+2. `canSyscallByNumber(frame.a3)` capability check
+3. `case frame.a3` dispatch to subsystem handler
+4. `setLastError` / `clearLastError` update
+5. `traceSyscallExit(frame)`
 
-The dispatch layer is intentionally thin: it performs tracing, centralized capability gating, dispatch to a subsystem handler, and `last_error` handling. Implementations live in domain-specific kernel syscall modules.
+If `canSyscallByNumber` rejects the syscall, the runtime sets `last_error` to `SysErrCap` and returns `-1` in `a0`.
 
-```text
-U-mode wrapper
-  -> ecall with a3 = syscall number
-  -> trap_entry constructs TrapFrame
-  -> handleSyscall()
-       -> trace enter
-       -> capability policy gate
-       -> subsystem handler
-       -> update last_error
-       -> trace exit
-  -> sepc += 4
-  -> deliver pending signals
-  -> reschedule if requested
-  -> sret
-```
+### Dispatch categories
+
+The syscall dispatcher in `src/kernel/trap/syscall.nim` forwards calls to handlers in:
+
+- `src/kernel/syscall/task/process_ops.nim`
+- `src/kernel/syscall/fs/file_ops.nim`
+- `src/kernel/syscall/fs/fs_service_ops.nim`
+- `src/kernel/syscall/ipc/ipc_ops.nim`
+- `src/kernel/syscall/mm/memory_ops.nim`
+- `src/kernel/syscall/net/net_ops.nim`
+- `src/kernel/syscall/service/service_ops.nim`
+- `src/kernel/syscall/system/system_ops.nim`
+
+The implementation covers ordinary user syscalls such as `SysRead`, `SysWrite`, `SysOpen`, `SysClose`, `SysPoll`, `SysExec`, `SysWait`, and `SysKill`, plus raw and service operations, process controls, trace control, entropy, and error reporting.
+
+### `last_error` handling
+
+After syscall dispatch, if the return value in `a0` has the sign bit set and the syscall is not `SysLastError`, the kernel may propagate `SysErrInval` when no other error was recorded. Otherwise, successful return values clear the process `last_error`.
 
 ## Timer and Preemption Path
 
-The timer device is programmed with an interval of `200000` time units. Every supervisor timer interrupt:
+Supervisor timer interrupts are the kernel's soft preemption point. `trap_handler` calls:
 
-1. Increments global and current-process tick accounting.
-2. Records idle ticks when the idle process is running.
-3. Produces CPU usage snapshots every 100 timer ticks.
-4. Wakes processes sleeping until an expired tick deadline.
-5. Polls UART input and wakes input waiters when bytes arrive.
-6. Programs the next timer deadline.
-7. Sets the reschedule request flag.
+- `countUpTimerTick()`
+- `countCurrentProcessCpuTick()`
+- `countUpIdleTick()` when the idle process is running
+- `snapshotProcessCpuWindow()` and `snapshotCpuWindow()` when a CPU-window boundary is reached
+- `wakeTimerWaiters(timerTickCount)`
+- `pollInput()` and `wakeInputWaiters()` for UART-driven events
+- `setNextTimer()` to program the next tick deadline
+- `requestResched()` to request a context switch
 
-If the interrupt arrived from U-mode, the return path immediately observes that request and may context-switch. Supervisor work is not involuntarily switched mid-handler; it reaches an explicit scheduling boundary.
+For interrupts delivered from U-mode, the handler also runs `deliverCurrentSignals()` and `maybeYieldOnResched()` before returning. The kernel does not forcibly preempt supervisor-mode work mid-handler.
 
 ## Fault Containment and Panic Logs
 
-Fault handling differs by privilege boundary:
+`faultOrPanic(...)` differentiates user and kernel faults:
 
-| Fault Origin | Result |
-| --- | --- |
-| U-mode process | Print a fault message, append one diagnostic line to `/var/log/user_panic.log`, mark the process zombie with status `255`, then schedule |
-| Kernel or S-mode context | Print `PANIC` diagnostic and enter an infinite `wfi` loop |
+- User-mode page faults and bad traps write a diagnostic entry to `/var/log/user_panic.log` and kill the faulting process with exit code `255`.
+- Kernel-mode or S-mode faults invoke `panicMsg(...)`, emit a panic banner, and spin in `arch.wfi()`.
 
-The userspace panic log stores PID, executable path, `scause`, `stval`, `sepc`, `sp`, and argument registers `a0` through `a3`, capped to a 512-byte formatted line per fault event.
+The panic log is constructed in `writeUserPanicLog` and includes:
+
+- `pid`
+- `exe`
+- `scause`
+- `stval`
+- `sepc`
+- `sp`
+- `a0` .. `a3`
+
+The line is capped at `512` bytes.
 
 ## Syscall Tracing
 
-The kernel trace subsystem can trace all processes or a selected PID and can optionally preview byte buffers. It prints:
+The trace subsystem in `src/kernel/trap/syscall_trace.nim` provides:
 
-- PID and executable path.
-- Syscall symbolic name and numeric identifier.
-- Named syscall arguments for known calls.
-- Return value.
-- An escaped data preview for selected write operations in verbose mode, limited to 48 bytes.
+- global trace enable/disable
+- per-PID filtering via `syscallTracePid`
+- verbose buffer preview via `syscallTraceVerbose`
 
-The following actual execution result shows one `/bin/ls` child under syscall tracing. Output from the traced program is expected to appear between `write_fd` entry and return records because both trace logging and application stdout share the console.
+`traceSyscallEnter` prints the syscall name and named arguments for known syscall IDs. Arguments that refer to user memory are validated through `copyUserCString` or `copyFromUser`; invalid user pointers render as `<badptr>` instead of causing kernel memory faults.
+
+`traceSyscallExit` prints the syscall return value after execution.
+
+### Example trace output
 
 ```text
 root@Rk-C:/$ stracectl -v ls /etc
@@ -156,4 +173,4 @@ shadow[strace] <- pid=23 sys=write_fd#59 ret=0x6
 root@Rk-C:/$
 ```
 
-Pointer formatting uses validated usercopy helpers, so a malformed pointer in a traced syscall is rendered as a bad pointer rather than being directly dereferenced by the tracing path.
+This trace log shows kernel trace output interleaved with process stdout, because both share the console device.
